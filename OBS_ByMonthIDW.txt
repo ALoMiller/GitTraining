@@ -1,0 +1,329 @@
+library(RODBC)
+library(maps)
+library(sp)
+library(gstat)
+library(maptools)
+library(rgdal)
+library(shapefiles)
+library(PBSmapping)
+library(lattice)
+nova <- odbcConnect(dsn="nova", uid="amiller", pwd="4486#vwda", believeNRows=FALSE)
+#bsb
+#nespp4 <- '3350'
+
+#NEFOP data
+q.obhau.h <- "SELECT link3, tripid, haulnum, lathbeg, lonhbeg, lathend, lonhend, gis_lathbeg, gis_lonhbeg, gis_lathend, gis_lonhend, 
+negear, area, obsrflag, dayhbeg, monthhbeg, yearhbeg
+FROM obhau
+WHERE (gis_lathbeg > 1 AND gis_lonhbeg < 0 AND obsrflag = 1) OR (gis_lathend > 1 AND gis_lonhend < 0 AND obsrflag = 1) 
+ORDER BY year"
+obhau.h.view <- sqlQuery(nova,q.obhau.h)  
+colnames(obhau.h.view) <- c('LINK3','TRIPID','HAULNUM','BEGLAT','BEGLON','ENDLAT','ENDLON','GISBEGLAT','GISBEGLON','GISENDLAT','GISENDLON','NEGEAR','AREA','OBSRFLAG','DAY','MONTH','YEAR')
+dim(obhau.h.view[unique(obhau.h.view$LINK3),]) #check all records are unique LINK3
+#obhau.h.view <- obhau.h.view[obhau.h.view$NEGEAR == '50' | obhau.h.view$NEGEAR == '100',] #use only otter trawls or gill net #214243
+
+q.obspp <- "SELECT link3, nespp4, hailwt, catdisp
+FROM obspp
+WHERE nespp4 = '3350'
+ORDER BY year"
+obspp.view <- sqlQuery(nova,q.obspp) #33310
+
+obs.data <- merge(obspp.view,obhau.h.view, by = 'LINK3', all.x=TRUE)#33310
+obs.kept <- obs.data[obs.data$CATDISP == 1,] #13323 
+obs.discard <- obs.data[obs.data$CATDISP == 0,] #18887
+#gear.data <- merge(obs.data, gear.view, by = 'NEGEAR')
+
+#ASM data
+q.asmhau.h <- "SELECT link3, tripid, haulnum, lathbeg, lonhbeg, lathend, lonhend, gis_lathbeg, gis_lonhbeg, gis_lathend, gis_lonhend, 
+negear, area, obsrflag, dayhbeg, monthhbeg, yearhbeg
+FROM asmhau
+WHERE (gis_lathbeg > 1 AND gis_lonhbeg < 0 AND obsrflag = 1) OR (gis_lathend > 1 AND gis_lonhend < 0 AND obsrflag = 1)
+ORDER BY year"
+asmhau.h.view <- sqlQuery(nova,q.asmhau.h) #67279
+colnames(asmhau.h.view) <- c('LINK3','TRIPID','HAULNUM','BEGLAT','BEGLON','ENDLAT','ENDLON','GISBEGLAT','GISBEGLON','GISENDLAT','GISENDLON','NEGEAR','AREA','OBSRFLAG','DAY','MONTH','YEAR')
+dim(asmhau.h.view[unique(asmhau.h.view$LINK3),]) #check all records are unique LINK3
+#asmhau.h.view <- asmhau.h.view[asmhau.h.view$NEGEAR == '50' | asmhau.h.view$NEGEAR == '100',] #use only otter trawls or gill net #65574
+
+q.asmspp <- "SELECT link3, nespp4, hailwt, catdisp
+FROM asmspp
+WHERE nespp4 = '3350'
+ORDER BY year"
+asmspp.view <- sqlQuery(nova,q.asmspp) #1989
+
+asm.data <- merge(asmspp.view,asmhau.h.view, by = 'LINK3', all.x=TRUE)#1989
+
+#combine ASM and Observer data
+comm.data <- rbind(obs.data,asm.data) #35299
+
+#for LAT to be used for Arc use GISENDLAT 1st, if NA use GISBEGLAT
+comm.data$LAT[is.na(comm.data$GISENDLAT)] <- comm.data$GISBEGLAT[is.na(comm.data$GISENDLAT)]
+comm.data$LAT[!is.na(comm.data$GISENDLAT)] <- comm.data$GISENDLAT[!is.na(comm.data$GISENDLAT)]
+#for LON to be used for Arc use GISENDLON 1st, if NA use GISBEGLAT
+comm.data$LON[is.na(comm.data$GISENDLON)] <- comm.data$GISBEGLON[is.na(comm.data$GISENDLON)]
+comm.data$LON[!is.na(comm.data$GISENDLON)] <- comm.data$GISENDLON[!is.na(comm.data$GISENDLON)]
+
+#Remove NAs
+sum(!is.na(comm.data$LAT) & !is.na(comm.data$LON))
+head(comm.data[(is.na(comm.data$LAT) & is.na(comm.data$LON)),])
+comm.data <- comm.data[-which(is.na(comm.data$LAT) & is.na(comm.data$LON)),] #34362
+
+comm.data$HAILWT <- comm.data$HAILWT * 0.00045359237 #pounds to metric tonnes 
+comm.data <- comm.data[(!is.na(comm.data$HAILWT)),] #removes NA records for HAILWT
+comm.data$LINK3 <- as.factor(as.character(comm.data$LINK3))
+
+#combine discards and kept catch
+bsb.catch <- tapply(comm.data$HAILWT, comm.data$LINK3, sum)
+bsb.year <- tapply(comm.data$YEAR, comm.data$LINK3, function(x) x[1])
+bsb.month <- tapply(comm.data$MONTH, comm.data$LINK3, function(x) x[1])
+bsb.day <- tapply(comm.data$DAY, comm.data$LINK3, function(x) x[1])
+bsb.gear <- tapply(comm.data$NEGEAR, comm.data$LINK3, function(x) x[1])
+bsb.lat <- tapply(comm.data$LAT, comm.data$LINK3, max)
+bsb.long <- tapply(comm.data$LON, comm.data$LINK3, max)
+bsb.combo <- as.data.frame(cbind(bsb.day, bsb.month, bsb.year, bsb.lat, bsb.long, bsb.catch, bsb.gear))
+colnames(bsb.combo) <- c('DAY','MONTH','YEAR','LAT','LONG','CATCH','GEAR')
+
+#Check for NAs
+dim(bsb.combo)#28762
+dim(bsb.combo[which(!is.na(bsb.combo$LONG)),])
+dim(bsb.combo[which(!is.na(bsb.combo$LAT)),])
+dim(bsb.combo[which(!is.na(bsb.combo$MONTH)),])
+dim(bsb.combo[which(!is.na(bsb.combo$YEAR)),])
+dim(bsb.combo[which(!is.na(bsb.combo$GEAR)),])
+
+#Sort by GearType
+bsb.combo$GEARTYPE <- rep(0, length(bsb.combo[,1]))
+bsb.combo$GEARTYPE[bsb.combo$GEAR == 10] <- 'LONGLINE'
+bsb.combo$GEARTYPE[bsb.combo$GEAR == 20] <- 'HANDLINE'
+bsb.combo$GEARTYPE[bsb.combo$GEAR > 49 & bsb.combo$GEAR < 60] <- 'TRAWL'
+bsb.combo$GEARTYPE[bsb.combo$GEAR > 99 & bsb.combo$GEAR < 120] <- 'GILLNET'
+bsb.combo$GEARTYPE[bsb.combo$GEAR == 132] <- 'DREDGE'
+bsb.combo$GEARTYPE[bsb.combo$GEAR > 169 & bsb.combo$GEAR < 302] <- 'POTS'
+
+#Convert to UTM
+stat_areas <- readShapePoly("//net/home10/amiller/POPDY/AssessmentWork/R/Maps/shapefiles/statareas/groundfish_stat_areas")
+US.areas <- readShapePoly("//net/home10/amiller/GIS/shapes/USA")
+hundredfathom <- readShapeLines("//net/home10/amiller/GIS/shapes/survey/b100")
+canada.areas <-readShapePoly("//net/home10/amiller/POPDY/AssessmentWork/R/Maps/shapefiles/Canada/Canada")
+Strata <- readShapePoly("//net/home10/amiller/POPDY/AssessmentWork/R/Maps/shapefiles/strata/groundfish_strata") ## read sampling strata
+
+spRef_UTM_19="+proj=utm +zone=19 +ellps=GRS80 +datum=NAD83 +units=m +no_defs"
+spRef_DD="+proj=longlat +ellps=GRS80 +datum=NAD83 +no_defs"
+
+proj4string(US.areas)=CRS(spRef_DD)
+US.areas_UTM=spTransform(US.areas, CRS(spRef_UTM_19))
+summary(US.areas_UTM)
+
+proj4string(hundredfathom)=CRS(spRef_DD)
+hundredfathom_UTM=spTransform(hundredfathom, CRS(spRef_UTM_19))
+summary(hundredfathom_UTM)
+
+proj4string(canada.areas)=CRS(spRef_DD)
+canada.areas_UTM=spTransform(canada.areas, CRS(spRef_UTM_19))
+summary(canada.areas_UTM)
+
+proj4string(stat_areas)=CRS(spRef_DD)
+stat_areas_UTM=spTransform(stat_areas, CRS(spRef_UTM_19))
+summary(stat_areas_UTM)
+
+coordinates(bsb.combo)=c("LONG", "LAT") ## convert to spatial points data frame
+proj4string(bsb.combo)=CRS(spRef_DD)
+bsb.combo_UTM=spTransform(bsb.combo, CRS(spRef_UTM_19))
+summary(bsb.combo_UTM)
+
+proj4string(Strata)=CRS(spRef_DD)
+Strata_UTM=spTransform(Strata, CRS(spRef_UTM_19))
+summary(Strata_UTM)
+
+###################################################################################################
+## Kriging models crash if you have two data points with the same coordinates but different values
+## so it is worth it to ensure that you don't have co-located data
+dim(bsb.combo)
+bsb.combo <- as.data.frame(bsb.combo)
+length(unique(rownames(bsb.combo))) ## all ID's are unique
+bsb.combo$Id <- rownames(bsb.combo)
+bsb.combo <- bsb.combo.bk
+nSites=with(bsb.combo, aggregate(bsb.combo$Id, by=list(Latitude=LAT, Longitude=LONG), length)); names(nSites)=c("Latitude", "Longitude", "Replicates")
+table(nSites$Replicates) ## note that there are 5 sites that are not unique
+bsb.combo=merge(bsb.combo, nSites)
+bsb.combo[which(bsb.combo$Replicates>1), ] ## note that the sites with duplicated coordinates are in different years, so no worries
+
+plot(stat_areas_UTM)
+points(bsb.combo_UTM, pch=20, col="blue")
+
+############ select a subset of the geographic area
+#Lim_UTM=data.frame(locator(2)) ## select two corners of a rectangle, bottom left first, top right second
+Lim_UTM <- data.frame(x=c(-145939.9,788347.3), y=c(3848267,4938848))
+
+plot(bsb.combo_UTM, pch=20, col="blue", cex=0.1)
+
+StrataCrds_UTM=data.frame(coordinates(Strata_UTM)); names(StrataCrds_UTM)=c("X", "Y") ## extract coordinates from Strata polygons
+SubStrata_UTM=Strata_UTM[which(StrataCrds_UTM$X>Lim_UTM$x[1] & StrataCrds_UTM$X<Lim_UTM$x[2] & StrataCrds_UTM$Y>Lim_UTM$y[1] & StrataCrds_UTM$Y<Lim_UTM$y[2]), ] ## trim the strata polygons to the extent of the sub area
+
+Grid_UTM=spsample(SubStrata_UTM,type="regular",cellsize=c(1000,1000)) ## create a grid of points to predict to
+Points_UTM=SpatialPointsDataFrame(Grid_UTM, data=data.frame(Stratum_UTM=over(Grid_UTM, SubStrata_UTM)$STRATA)) ## convert to spatialpointsdata frame and add strata for "data"
+PxBSB_UTM <- as(Points_UTM, "SpatialPixelsDataFrame") ## convert to spatialpixelsdata frame
+
+BSB_Bk_UTM=BSB_UTM ## backup the data before you start dropping records
+#BSB=BSB[-which(is.na(over(BSB, SubStrata))), ]
+BSB_UTM=BSB_UTM[-which(is.na(BSB_UTM$BotSalin)), ]
+bsb.2015 <- bsb.combo_UTM[bsb.combo_UTM$YEAR == 2015,]
+  
+library(lattice)
+bsb.2015.lst <- list()
+
+for (i in min(bsb.2015$MONTH):max(bsb.2015$MONTH)){
+  bsb.2015.lst[[as.character(i)]] <- bsb.2015[which(bsb.2015$MONTH ==i),]
+}
+sapply(bsb.2015.lst, dim)
+
+for (i in names(bsb.2015.lst)){
+  print(i)
+  Interp <- idw(CATCH~1, bsb.2015.lst[[i]], PxBSB_UTM, idp=3) ## run interpolation
+  PxBSB_UTM[[paste('sp',i,'_Pred',sep = '')]] <- Interp$var1.pred     ## move the results to your grid
+  trellis.par.set(sp.theme()) ## set color scheme
+}
+
+od <- "//net/home10/amiller/POPDY/BSB/OBSIDW/map_output/"     #directory where output files will be saved
+land.color = "grey80" # color that the land will be filled  (use hexbin or colorname)
+
+library(RColorBrewer)
+newPalette<-c("#C58ADA","#E84310","#76B5EE","#62C35B","#E0D60C")
+#newPalette<-c("#E0D60C","#62C35B","#76B5EE","#E84310","#E84310","#C58ADA")
+
+rgb.palette <- colorRampPalette(newPalette,
+  space = "Lab")
+
+for(i in 1:12){
+  png(filename = paste(od,"BSB.FALLtemp14cm_UTM.", as.character(i),".png", sep=""), width = 20, height = 10, units = 'in', res = 300)
+  
+US <- list('sp.polygons', US.areas_UTM, col = land.color)
+Canada <- list('sp.polygons', canada.areas_UTM, col = land.color)
+
+layout <- list(US, Canada)
+temp <- spplot(PxBSB_UTM[c(paste('sp',i,'_Pred',sep = ''))], 
+  sp.layout = layout, names.attr = '2015',
+  col.regions=rgb.palette(12) )
+  #scales=list(draw=TRUE, cex=0.75)
+
+#update(temp, key=simpleKey(levels(meuse$soil), points=TRUE, columns=1, space='right'))
+
+print(temp)  
+dev.off()
+}
+
+#SETUP FOR MAPPING
+# read in polygons
+thirtyfathom <- readShapeLines("//net/home10/amiller/POPDY/AssessmentWork/R/Maps/shapefiles/30_fathom/30_fathom")
+fiftyfathom <- readShapeLines("//net/home10/amiller/POPDY/AssessmentWork/R/Maps/shapefiles/50_fathom/50_fathom")
+eez <- readShapeLines("//net/home10/amiller/POPDY/AssessmentWork/R/Maps/shapefiles/eez/eez") 
+hundredfathom <- readShapeLines("//net/home10/amiller/GIS/shapes/survey/b100")
+US.areas <- readShapePoly("//net/home10/amiller/POPDY/AssessmentWork/R/Maps/shapefiles/UnitedStates/United_States")
+canada.areas <-readShapePoly("//net/home10/amiller/POPDY/AssessmentWork/R/Maps/shapefiles/Canada/Canada")
+
+#Tim's code to add degree symbol in lat/long labels
+lat.range = c(34.25,45)         # cutoff of the latitude range for plotting
+lon.range = c(-76.5, -65.5)    # cutoff of the latitude range (note: negative for longitude in New England Area)
+axis.lat <- vector('expression', length(pretty(lat.range)))
+for(i in 1:length(axis.lat)) axis.lat[i] <- substitute(expression(paste(k*~degree, 'N')), list(k = pretty(lat.range)[i]))[2]
+
+axis.lon <- vector('expression', length(pretty(lon.range)))
+for(i in 1:length(axis.lon)) axis.lon[i] <- substitute(expression(paste(k*~degree, 'W')), list(k = -1*pretty(lon.range)[i]))[2]
+
+months <- c('January','February','March','April','May','June','July','August','September','October','November','December')
+months <- cbind(MONTH=months,ODD=formatC((1:12 + 0:11), width = 2, flag = '0'),EVEN=formatC((1:12*2), width = 2, flag = '0'))
+
+land.color = "grey80" # color that the land will be filled  (use hexbin or colorname)
+
+#bins.avgs <- c(0,0.25,0.5,1.0,2.5) #metric tonnes - up to 5 is first bin, 5-10 second bin, 10-25 third bin, 25+ fourth bin
+bins.avgs <- c(0,50,100,500,1000) #pounds - up to 10 is first bin, 10-25 second bin, 25-50 third bin, 50-100 fourth bin, 100 + fifth bin
+n.grids.per.lat = 12  #12 gives 5 minute squares; adjust to desired level of aggregation
+grid.size <- 1/n.grids.per.lat
+mygrid <- makeGrid(x=seq(lon.range[1], lon.range[2], by=grid.size) , y=seq(lat.range[1], lat.range[2], by=grid.size) )
+cell.colors <- c("#ffffcc","#a1dab4","#41b6c4","#2c7fb8","#253494") #colors for left panel plot to indicate Kg/tow
+
+bsb.combo.lst <- list()
+pdata.lst <- list()
+for (i in 1:12) {
+bsb.combo.lst[[paste(i,'a',sep='')]] <- bsb.combo[bsb.combo$MONTH == i & bsb.combo$DAY < 16,]
+bsb.combo.lst[[paste(i,'b',sep='')]] <- bsb.combo[bsb.combo$MONTH == i & bsb.combo$DAY > 15,]
+
+zzz <- cbind(EID=seq(1,length(bsb.combo.lst[[paste(i,'a',sep='')]][,1])), X=bsb.combo.lst[[paste(i,'a',sep='')]]$LONG,
+  Y=bsb.combo.lst[[paste(i,'a',sep='')]]$LAT, Z=bsb.combo.lst[[paste(i,'a',sep='')]]$CATCH) 
+zzz <- as.EventData(zzz)
+locData <- findCells(zzz, mygrid)
+locData <- locData[!duplicated(locData$EID),]
+pdata <- combineEvents(zzz, locData, FUN=sum)
+pdata <- makeProps(pdata, c(bins.avgs,1e6), "col", cell.colors)   #append a column to pdata for the color property for the grids
+range(pdata$Z) #determine range of bins to make changes
+pdata.lst[[paste(i,'a',sep='')]] <- pdata
+
+zzz <- cbind(EID=seq(1,length(bsb.combo.lst[[paste(i,'b',sep='')]][,1])), X=bsb.combo.lst[[paste(i,'b',sep='')]]$LONG,
+  Y=bsb.combo.lst[[paste(i,'b',sep='')]]$LAT, Z=bsb.combo.lst[[paste(i,'b',sep='')]]$CATCH) 
+zzz <- as.EventData(zzz)
+locData <- findCells(zzz, mygrid)
+locData <- locData[!duplicated(locData$EID),]
+pdata <- combineEvents(zzz, locData, FUN=sum)
+pdata <- makeProps(pdata, c(bins.avgs,1e6), "col", cell.colors)   #append a column to pdata for the color property for the grids
+range(pdata$Z) #determine range of bins to make changes
+pdata.lst[[paste(i,'b',sep='')]] <- pdata
+}
+
+######
+###### MAP
+for (i in 1:12) {
+png(filename = paste("//net/home10/amiller/POPDY/BSB/OBSIDW/map_output/GIF/BSBObsMonth",months[i,2],".png", sep = ''), width = 8, height = 9, units = "in", res = 400)
+par(mar = c(0.5,0.5,0.5,0.5), oma = c(2,3,3,2))
+plotPolys(mygrid, polyProps=pdata.lst[[paste(i,'a',sep='')]], border="grey80", ylim=c(lat.range[1], lat.range[2]),
+  xlim=c(lon.range[1],lon.range[2]), axes=F, las=1, ylab = '', xlab = '')  #this makes border edges light gray around the grid fill colors  
+axis(2, at = pretty(lat.range), labels = axis.lat, las=1, tck = -0.02) 
+axis(1, at = pretty(lon.range), labels = axis.lon, las=1, tck = -0.02) 
+
+plot(US.areas, col=land.color, add=T )
+plot(hundredfathom, lty = 1, add=T, col = 'grey75')
+plot(fiftyfathom, lty = 1, add=T, col = 'grey75' )
+plot(eez, lty = 2, add=T )
+plot(canada.areas, col = land.color, add =T)
+box()
+legend(-68.5,38.8, pt.cex=1.5, cex=0.85, title = 'Observed catch wt. (lbs)',
+  #legend=c("<0.25","0.25-0.5","0.5-1","1-2.5",">2.5", "50 fathoms", "100 fathoms"), 
+  legend=c("<50","50-100","100-500","500-1000",">1000", "50 fathoms", "100 fathoms"), 
+  lty=c(NA,NA,NA,NA,NA,1,1),
+  lwd = c(NA,NA,NA,NA,NA,1,1),
+  pch = c(22,22,22,22,22,NA,NA),
+  pt.bg = c(cell.colors,NA,NA),
+  col = c("grey","grey","grey","grey","grey","grey75","grey75"),
+  bg="white", box.col = "white") 
+mtext(months[i], outer = TRUE, cex=2)
+dev.off()
+}
+
+for (i in 1:12) {
+  png(filename = paste("//net/home10/amiller/POPDY/BSB/OBSIDW/map_output/GIF/BSBObsMonth",months[i,3],".png", sep = ''), width = 8, height = 9, units = "in", res = 400)
+  par(mar = c(0.5,0.5,0.5,0.5), oma = c(2,3,3,2))
+  plotPolys(mygrid, polyProps=pdata.lst[[paste(i,'b',sep='')]], border="grey80", ylim=c(lat.range[1], lat.range[2]),
+    xlim=c(lon.range[1],lon.range[2]), axes=F, las=1, ylab = '', xlab = '')  #this makes border edges light gray around the grid fill colors  
+  axis(2, at = pretty(lat.range), labels = axis.lat, las=1, tck = -0.02) 
+  axis(1, at = pretty(lon.range), labels = axis.lon, las=1, tck = -0.02) 
+  
+  plot(US.areas, col=land.color, add=T )
+  plot(hundredfathom, lty = 1, add=T, col = 'grey75')
+  plot(fiftyfathom, lty = 1, add=T, col = 'grey75' )
+  plot(eez, lty = 2, add=T )  
+  plot(canada.areas, col = land.color, add =T)
+  box()
+  legend(-68.5,38.8, pt.cex=1.5, cex=0.85, title = 'Observed catch wt. (lbs)',
+    #legend=c("<0.25","0.25-0.5","0.5-1","1-2.5",">2.5", "50 fathoms", "100 fathoms"), 
+    legend=c("<50","50-100","100-500","500-1000",">1000", "50 fathoms", "100 fathoms"), 
+    lty=c(NA,NA,NA,NA,NA,1,1),
+    lwd = c(NA,NA,NA,NA,NA,1,1),
+    pch = c(22,22,22,22,22,NA,NA),
+    pt.bg = c(cell.colors,NA,NA),
+    col = c("grey","grey","grey","grey","grey","grey75","grey75"),
+    bg="white", box.col = "white") 
+  mtext(months[i], outer = TRUE, cex=2)
+  dev.off()
+}
+
+setwd("//net/home10/amiller/POPDY/BSB/OBSIDW/map_output/GIF")
+system('"C:\\Program Files\\ImageMagick-6.9.3-Q16\\convert.exe" -delay 80 -loop 1 *.png BSBObs_biMonthly.gif')
+file.remove(list.files(pattern=".png"))
